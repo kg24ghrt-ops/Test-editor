@@ -33,23 +33,23 @@ jobs:
 
       - name: Build Swift App
         run: |
-          swift build -c release --arch ${{ env.APP_NAME == 'PythonRunner' && 'x86_64' || env.ARCH }}
+          swift build -c release --arch ${{ env.ARCH }}
 
-           - name: Create App Bundle
+      - name: Create App Bundle
         run: |
-          # Locate any executable file produced by the local package compilation
-          BINARY=$(find .build/release -maxdepth 2 -type f -permalink +111 ! -name "*.*" | head -n 1)
+          # Robust macOS find command to grab the main executable binary inside the release folder
+          BINARY=$(find .build/release -maxdepth 1 -type f ! -name "*.*" ! -name "Package*" | head -n 1)
           if [ -z "$BINARY" ]; then
             echo "Error: Compiled binary not found!"
             exit 1
           fi
-          echo "Found binary at: $BINARY"
+          echo "Found compiled binary at: $BINARY"
 
           APP_DIR=".build/artifacts/${{ env.APP_NAME }}.app"
           mkdir -p "$APP_DIR/Contents/MacOS"
           mkdir -p "$APP_DIR/Contents/Resources"
 
-          # Copy the binary and rename it to match the application bundle identity
+          # Copies the binary and sets up the correct application execution name
           cp "$BINARY" "$APP_DIR/Contents/MacOS/${{ env.APP_NAME }}"
           chmod +x "$APP_DIR/Contents/MacOS/${{ env.APP_NAME }}"
 
@@ -61,7 +61,6 @@ jobs:
             echo "Error: Info.plist not found!"
             exit 1
           fi
-
 
       - name: Install create-dmg
         run: brew install create-dmg
