@@ -37,8 +37,8 @@ jobs:
 
       - name: Create App Bundle
         run: |
-          # Robust macOS find command to grab the main executable binary inside the release folder
-          BINARY=$(find .build/release -maxdepth 1 -type f ! -name "*.*" ! -name "Package*" | head -n 1)
+          # Searches recursively inside the build folder for the exact compiled executable name
+          BINARY=$(find .build -type f -name "NovaCibesRunner" | head -n 1)
           if [ -z "$BINARY" ]; then
             echo "Error: Compiled binary not found!"
             exit 1
@@ -49,7 +49,6 @@ jobs:
           mkdir -p "$APP_DIR/Contents/MacOS"
           mkdir -p "$APP_DIR/Contents/Resources"
 
-          # Copies the binary and sets up the correct application execution name
           cp "$BINARY" "$APP_DIR/Contents/MacOS/${{ env.APP_NAME }}"
           chmod +x "$APP_DIR/Contents/MacOS/${{ env.APP_NAME }}"
 
