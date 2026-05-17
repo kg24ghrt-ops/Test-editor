@@ -1,15 +1,27 @@
 import AppKit
 
-@main
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var mainWindowController: MainWindowController?
+    var window: NSWindow!
+    var editorViewController: EditorViewController!
 
-    func applicationDidFinishLaunching(_ aNotification: Notification) {
-        let windowController = MainWindowController()
-        windowController.showWindow(nil)
-        self.mainWindowController = windowController
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // 1. Configure the window size and style masks
+        let mask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: mask,
+            backing: .buffered,
+            defer: false
+        )
+        
+        // 2. Initialize the view controller and inject it into the window
+        editorViewController = EditorViewController()
+        window.contentViewController = editorViewController
+        
+        // 3. Center the interface on screen and bring it to focus
+        window.title = "Python Runner Editor"
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
-
-    func applicationWillTerminate(_ aNotification: Notification) {}
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { return true }
 }
