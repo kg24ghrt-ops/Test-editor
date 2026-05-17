@@ -1,8 +1,13 @@
 import AppKit
 
+@main
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var editorViewController: EditorViewController!
+    
+    // ... rest of your existing AppDelegate logic remains completely unchanged
+
+
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 1. Configure the window size and style masks
