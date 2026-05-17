@@ -51,7 +51,7 @@ final class EditorViewController: NSViewController {
 public struct PythonLexer: Lexer {
     public init() {}
     
-    public func getInternalTokens(_ source: String) -> [Token] {
+    public func getSavannaTokens(input: String) -> [Token] {
         // Return an empty token array; Sourceful falls back to beautiful, safe default text rendering
         return []
     }
