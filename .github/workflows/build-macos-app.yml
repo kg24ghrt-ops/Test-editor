@@ -35,11 +35,12 @@ jobs:
         run: |
           swift build -c release --arch ${{ env.APP_NAME == 'PythonRunner' && 'x86_64' || env.ARCH }}
 
-      - name: Create App Bundle
+           - name: Create App Bundle
         run: |
-          BINARY=$(find .build -type f -name "${{ env.APP_NAME }}" | head -n 1)
+          # Locate any executable file produced by the local package compilation
+          BINARY=$(find .build/release -maxdepth 2 -type f -permalink +111 ! -name "*.*" | head -n 1)
           if [ -z "$BINARY" ]; then
-            echo "Error: Binary not found!"
+            echo "Error: Compiled binary not found!"
             exit 1
           fi
           echo "Found binary at: $BINARY"
@@ -48,7 +49,8 @@ jobs:
           mkdir -p "$APP_DIR/Contents/MacOS"
           mkdir -p "$APP_DIR/Contents/Resources"
 
-          cp "$BINARY" "$APP_DIR/Contents/MacOS/"
+          # Copy the binary and rename it to match the application bundle identity
+          cp "$BINARY" "$APP_DIR/Contents/MacOS/${{ env.APP_NAME }}"
           chmod +x "$APP_DIR/Contents/MacOS/${{ env.APP_NAME }}"
 
           if [ -f "test-editor/Info.plist" ]; then
@@ -59,6 +61,7 @@ jobs:
             echo "Error: Info.plist not found!"
             exit 1
           fi
+
 
       - name: Install create-dmg
         run: brew install create-dmg
