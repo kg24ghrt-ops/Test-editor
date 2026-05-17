@@ -33,16 +33,17 @@ jobs:
 
       - name: Build Swift App
         run: |
-          swift build -c release --arch ${{ env.ARCH }}
-
-      - name: Locate Binary
-        run: |
-          BINARY=$(find .build -type f -name "${{ env.APP_NAME }}" | head -n 1)
-          echo "BINARY=$BINARY" >> $GITHUB_ENV
-          echo "Found binary at: $BINARY"
+          swift build -c release --arch ${{ env.APP_NAME == 'PythonRunner' && 'x86_64' || env.ARCH }}
 
       - name: Create App Bundle
         run: |
+          BINARY=$(find .build -type f -name "${{ env.APP_NAME }}" | head -n 1)
+          if [ -z "$BINARY" ]; then
+            echo "Error: Binary not found!"
+            exit 1
+          fi
+          echo "Found binary at: $BINARY"
+
           APP_DIR=".build/artifacts/${{ env.APP_NAME }}.app"
           mkdir -p "$APP_DIR/Contents/MacOS"
           mkdir -p "$APP_DIR/Contents/Resources"
@@ -50,7 +51,14 @@ jobs:
           cp "$BINARY" "$APP_DIR/Contents/MacOS/"
           chmod +x "$APP_DIR/Contents/MacOS/${{ env.APP_NAME }}"
 
-          cp Info.plist "$APP_DIR/Contents/"
+          if [ -f "test-editor/Info.plist" ]; then
+            cp test-editor/Info.plist "$APP_DIR/Contents/"
+          elif [ -f "Info.plist" ]; then
+            cp Info.plist "$APP_DIR/Contents/"
+          else
+            echo "Error: Info.plist not found!"
+            exit 1
+          fi
 
       - name: Install create-dmg
         run: brew install create-dmg
