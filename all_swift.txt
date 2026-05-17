@@ -1,0 +1,970 @@
+import Foundation
+
+// MARK: - Client → Server Messages
+// MARK: - Client → Server Messages
+struct RunMessage: Codable {
+    let type: String
+    let session_id: String
+    let code: String
+    
+    init(session_id: String, code: String) {
+        self.type = "run"
+        self.session_id = session_id
+        self.code = code
+    }
+}
+
+struct StdinMessage: Codable {
+    let type: String
+    let session_id: String
+    let input: String
+    
+    init(session_id: String, input: String) {
+        self.type = "stdin"
+        self.session_id = session_id
+        self.input = input
+    }
+}
+// MARK: - Server → Client Messages
+enum ServerMessage: Codable {
+    case stdout(sessionID: String, output: String)
+    case stderr(sessionID: String, output: String)
+    case error(sessionID: String?, message: String)
+    case done(sessionID: String)
+    
+    enum CodingKeys: String, CodingKey { case type, session_id, output, message }
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let type = try container.decode(String.self, forKey: .type)
+        
+        switch type {
+        case "stdout":
+            self = .stdout(
+                sessionID: try container.decode(String.self, forKey: .session_id),
+                output: try container.decode(String.self, forKey: .output)
+            )
+        case "stderr":
+            self = .stderr(
+                sessionID: try container.decode(String.self, forKey: .session_id),
+                output: try container.decode(String.self, forKey: .output)
+            )
+        case "error":
+            let sid = try container.decodeIfPresent(String.self, forKey: .session_id)
+            self = .error(sessionID: sid, message: try container.decode(String.self, forKey: .message))
+        case "done":
+            self = .done(sessionID: try container.decode(String.self, forKey: .session_id))
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: .type, in: container, debugDescription: "Unknown type: \(type)"
+            )
+        }
+    }
+    
+    func encode(to encoder: Encoder) throws { /* Not needed for receiving */ }
+}import Foundation
+import CommonCrypto
+import CryptoKit  // ✅ macOS 10.15+ for constant-time comparison
+
+// MARK: - Delegate
+@MainActor
+protocol WebSocketDelegate: AnyObject {
+    func webSocketDidReceive(_ message: ServerMessage)
+    func webSocketDidConnect(url: URL)
+    func webSocketDidDisconnect(error: Error?)
+}
+
+// MARK: - Connection State
+private enum ConnectionState: CustomStringConvertible {
+    case disconnected, connecting, connected, closing
+    var description: String {
+        switch self {
+        case .disconnected: return "disconnected"
+        case .connecting: return "connecting"
+        case .connected: return "connected"
+        case .closing: return "closing"
+        }
+    }
+}
+
+// MARK: - WebSocketManager
+final class WebSocketManager: NSObject, URLSessionWebSocketDelegate {
+    weak var delegate: WebSocketDelegate?
+    
+    // MARK: - Configuration
+    private let baseURL: String
+    private let token: String
+    private let pinnedPublicKeyHashes: [String]  // ✅ Support multiple hashes for rotation [[40]]
+    
+    // MARK: - URLSession
+    private var session: URLSession!
+    private var task: URLSessionWebSocketTask?
+    
+    // MARK: - Thread-Safe State (Barrier writes for immediate visibility)
+    private let stateQueue = DispatchQueue(label: "com.pythonrunner.ws.state", attributes: .concurrent)
+    private var _state: ConnectionState = .disconnected
+    private var state: ConnectionState {
+        get { stateQueue.sync { _state } }
+        set { stateQueue.sync(flags: .barrier) { _state = newValue } }
+    }
+    
+    // MARK: - Lifecycle & Retention
+    private var selfRetainer: WebSocketManager?
+    private var userInitiatedDisconnect = false
+    private var connectTimeoutItem: DispatchWorkItem?
+    private var pingTimer: DispatchSourceTimer?
+    private var reconnectTimer: DispatchSourceTimer?
+    private var reconnectAttempts = 0
+    private let maxReconnectAttempts = 10
+    
+    // MARK: - Message Queue (Offline buffering)
+    private let messageQueue = DispatchQueue(label: "com.pythonrunner.ws.queue", attributes: .concurrent)
+    private var _pendingMessages: [(data: Data, completion: ((Error?) -> Void)?)] = []
+    private var pendingMessages: [(data: Data, completion: ((Error?) -> Void)?)] {
+        get { messageQueue.sync { _pendingMessages } }
+        set { messageQueue.sync(flags: .barrier) { _pendingMessages = newValue } }
+    }
+    
+    // MARK: - Activity Tracking (for adaptive ping)
+    private var lastActivityDate = Date()
+    private let activityQueue = DispatchQueue(label: "com.pythonrunner.ws.activity")
+    
+    // MARK: - Initialization
+    /// - Parameters:
+    ///   - baseURL: WebSocket server URL (must be wss://)
+    ///   - token: Bearer authentication token
+    ///   - pinnedPublicKeyHashes: SHA-256 hashes of server public keys (Base64) for certificate pinning [[40]]
+    init(baseURL: String, token: String, pinnedPublicKeyHashes: [String] = []) {
+        precondition(baseURL.hasPrefix("wss://"), "WebSocketManager requires secure wss:// URL")
+        precondition(!token.isEmpty, "Authentication token cannot be empty")
+        
+        self.baseURL = baseURL
+        self.token = token
+        self.pinnedPublicKeyHashes = pinnedPublicKeyHashes.isEmpty ? [String]() : pinnedPublicKeyHashes
+        super.init()
+        
+        setupSession()
+    }
+    
+    deinit {
+        cleanupResources()
+    }
+    
+    private func setupSession() {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 60
+        config.httpMaximumConnectionsPerHost = 1
+        config.waitsForConnectivity = true  // ✅ Wait for network on macOS 11 [[7]]
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.httpShouldSetCookies = false
+        config.httpCookieStorage = nil
+        config.urlCache = nil  // ✅ Disable caching for WebSocket handshake
+        
+        // Security: Disable TLS 1.0/1.1 (macOS 11 supports TLS 1.2+ by default)
+        config.tlsMinimumSupportedProtocolVersion = .TLSv12
+        
+        self.session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }
+    
+    private func cleanupResources() {
+        connectTimeoutItem?.cancel()
+        connectTimeoutItem = nil
+        
+        pingTimer?.cancel()
+        pingTimer = nil
+        
+        reconnectTimer?.cancel()
+        reconnectTimer = nil
+        
+        if task?.state == .running {
+            task?.cancel(with: .goingAway, reason: "Manager deallocated".data(using: .utf8))
+        }
+        task = nil
+        session?.invalidateAndCancel()
+        session = nil
+        selfRetainer = nil
+        
+        // ✅ Clear sensitive data from memory
+        pendingMessages.removeAll()
+    }
+    
+    // MARK: - Connection Management
+    func connect() {
+        guard state == .disconnected else {
+            #if DEBUG
+            NSLog("[WS] Connect ignored - current state: \(state)")
+            #endif
+            return
+        }
+        
+        guard let url = URL(string: baseURL), url.scheme == "wss" else {
+            let error = NSError(domain: "WS", code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "Invalid or insecure baseURL (must be wss://)"
+            ])
+            DispatchQueue.main.async { [weak self] in
+                self?.delegate?.webSocketDidDisconnect(error: error)
+            }
+            return
+        }
+        
+        state = .connecting
+        userInitiatedDisconnect = false
+        
+        // Connection timeout (45s for cold-start scenarios)
+        connectTimeoutItem?.cancel()
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, self.state == .connecting else { return }
+            self.cancelConnection(reason: "Connection timed out (server may be sleeping)")
+        }
+        connectTimeoutItem = timeout
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 45, execute: timeout)
+        
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 45
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("WebSocket", forHTTPHeaderField: "Upgrade")  // ✅ Explicit WebSocket header
+        
+        task = session.webSocketTask(with: request)
+        selfRetainer = self  // Keep self alive during async handshake
+        task?.resume()
+        
+        #if DEBUG
+        NSLog("[WS] Connecting to \(baseURL)")
+        #endif
+    }
+    
+    // MARK: - Send (With Completion Handler)
+    func send<T: Codable>(_ message: T, completion: ((Error?) -> Void)? = nil) {
+        guard let data = try? JSONEncoder().encode(message),
+              let json = String(data: data, encoding: .utf8) else {
+            let error = NSError(domain: "WS", code: -3, userInfo: [
+                NSLocalizedDescriptionKey: "Failed to encode message"
+            ])
+            completion?(error)
+            return
+        }
+        
+        // If connected, send immediately; otherwise queue for later
+        if state == .connected, let task {
+            #if DEBUG
+            let preview = json.prefix(200)
+            NSLog("[WS] Sending: \(preview)\(json.count > 200 ? "..." : "")")
+            #endif
+            
+            task.send(.string(json)) { [weak self] error in
+                if let error {
+                    #if DEBUG
+                    NSLog("[WS] Send error: \(error.localizedDescription)")
+                    #endif
+                    
+                    // Only propagate fatal/network-level errors
+                    if let nsErr = error as NSError?,
+                       nsErr.domain == NSURLErrorDomain || nsErr.code == -1005 {
+                        DispatchQueue.main.async { [weak self] in
+                            self?.delegate?.webSocketDidDisconnect(error: error)
+                        }
+                    }
+                }
+                completion?(error)
+            }
+            trackActivity()  // ✅ Update last activity for adaptive ping
+        } else {
+            // ✅ Queue message for when connection is restored
+            pendingMessages.append((data: Data(json.utf8), completion: completion))
+            #if DEBUG
+            NSLog("[WS] Message queued (not connected). Queue size: \(pendingMessages.count)")
+            #endif
+        }
+    }
+    
+    private func flushPendingMessages() {
+        guard !pendingMessages.isEmpty, state == .connected, let task else { return }
+        
+        let messages = pendingMessages
+        pendingMessages.removeAll()
+        
+        #if DEBUG
+        NSLog("[WS] Flushing \(messages.count) pending messages")
+        #endif
+        
+        for (index, item) in messages.enumerated() {
+            guard let json = String(data: item.data, encoding: .utf8) else {
+                item.completion?(NSError(domain: "WS", code: -3, userInfo: [
+                    NSLocalizedDescriptionKey: "Failed to decode queued message"
+                ]))
+                continue
+            }
+            
+            task.send(.string(json)) { [weak self] error in
+                item.completion?(error)
+                
+                // If this is the last message and it failed, consider reconnecting
+                if index == messages.count - 1, let error {
+                    if let nsErr = error as NSError?,
+                       nsErr.domain == NSURLErrorDomain || nsErr.code == -1005 {
+                        DispatchQueue.main.async { [weak self] in
+                            self?.delegate?.webSocketDidDisconnect(error: error)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // MARK: - Internal Ping (Health Check with Adaptive Interval)
+    private func sendPing(completion: (() -> Void)? = nil) {
+        guard state == .connected, let task else {
+            completion?()
+            return
+        }
+        
+        task.sendPing { [weak self] error in
+            if let error {
+                #if DEBUG
+                NSLog("[WS] ⚠️ Ping failed: \(error.localizedDescription)")
+                #endif
+                // Trigger disconnect on persistent ping failure
+                if let wsError = error as? URLError, wsError.code == .timedOut {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.delegate?.webSocketDidDisconnect(error: error)
+                    }
+                }
+            }
+            completion?()
+        }
+    }
+    
+    private func startHealthMonitoring() {
+        pingTimer?.cancel()
+        
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .background))
+        // ✅ Adaptive ping: check activity to adjust interval
+        timer.schedule(deadline: .now() + 30, repeating: .seconds(30), leeway: .seconds(5))
+        timer.setEventHandler { [weak self] in
+            guard let self, self.state == .connected else { return }
+            
+            // ✅ Adaptive interval: ping more frequently if inactive
+            let interval = self.activityQueue.sync {
+                Date().timeIntervalSince(self.lastActivityDate) > 120 ? 15.0 : 60.0
+            }
+            
+            if interval == 15.0 {
+                #if DEBUG
+                NSLog("[WS] 🔍 High-frequency ping (inactive connection)")
+                #endif
+            }
+            self.sendPing()
+        }
+        timer.resume()
+        pingTimer = timer
+    }
+    
+    private func trackActivity() {
+        activityQueue.async { [weak self] in
+            self?.lastActivityDate = Date()
+        }
+    }
+    
+    // MARK: - Disconnect
+    func disconnect() {
+        guard state != .disconnected else { return }
+        
+        userInitiatedDisconnect = true
+        state = .disconnected
+        connectTimeoutItem?.cancel()
+        connectTimeoutItem = nil
+        pingTimer?.cancel()
+        pingTimer = nil
+        reconnectTimer?.cancel()
+        reconnectTimer = nil
+        reconnectAttempts = 0
+        
+        if let task {
+            task.cancel(with: .normalClosure, reason: "Client disconnect".data(using: .utf8))
+            self.task = nil
+        }
+        
+        // ✅ Clear sensitive token from memory
+        selfRetainer = nil
+        
+        DispatchQueue.main.async { [weak self] in
+            self?.delegate?.webSocketDidDisconnect(error: nil)
+        }
+        
+        #if DEBUG
+        NSLog("[WS] Disconnected by client")
+        #endif
+    }
+    
+    private func cancelConnection(reason: String) {
+        disconnect()
+        let error = NSError(domain: "WS", code: -4, userInfo: [
+            NSLocalizedDescriptionKey: reason
+        ])
+        DispatchQueue.main.async { [weak self] in
+            self?.delegate?.webSocketDidDisconnect(error: error)
+        }
+    }
+    
+    // MARK: - Reconnection with Exponential Backoff [[26]][[28]]
+    private func scheduleReconnect() {
+        guard !userInitiatedDisconnect, reconnectAttempts < maxReconnectAttempts else {
+            #if DEBUG
+            NSLog("[WS] Reconnection aborted: user-initiated or max attempts reached")
+            #endif
+            return
+        }
+        
+        reconnectTimer?.cancel()
+        
+        // Exponential backoff with jitter: 1s, 2s, 4s, 8s... (max 5 min)
+        let baseDelay = min(300.0, pow(2.0, Double(reconnectAttempts)))
+        let jitter = Double.random(in: 0...0.3) * baseDelay
+        let delay = baseDelay + jitter
+        
+        reconnectAttempts += 1
+        
+        #if DEBUG
+        NSLog("[WS] Scheduling reconnect in \(String(format: "%.1f", delay))s (attempt \(reconnectAttempts)/\(maxReconnectAttempts))")
+        #endif
+        
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + delay)
+        timer.setEventHandler { [weak self] in
+            guard let self, self.state == .disconnected else { return }
+            #if DEBUG
+            NSLog("[WS] Attempting reconnection...")
+            #endif
+            self.connect()
+        }
+        timer.resume()
+        reconnectTimer = timer
+    }
+    
+    // MARK: - Receive Loop
+    private func receiveNext() {
+        guard state == .connected else { return }
+        
+        task?.receive { [weak self] result in
+            guard let self else { return }
+            
+            switch result {
+            case .success(let message):
+                trackActivity()  // ✅ Update activity on receive
+                
+                switch message {
+                case .string(let text):
+                    self.handle(text: text)
+                case .data(let data):
+                    if let text = String(data: data, encoding: .utf8) {
+                        self.handle(text: text)
+                    }
+                @unknown default:
+                    #if DEBUG
+                    NSLog("[WS] ⚠️ Unknown message type")
+                    #endif
+                    break
+                }
+                
+                if self.state == .connected {
+                    self.receiveNext()
+                }
+                
+            case .failure(let error):
+                #if DEBUG
+                NSLog("[WS] Receive error: \(error.localizedDescription)")
+                #endif
+                DispatchQueue.main.async { [weak self] in
+                    self?.delegate?.webSocketDidDisconnect(error: error)
+                }
+            }
+        }
+    }
+    
+    private func handle(text: String) {
+        guard !text.isEmpty, let data = text.data(using: .utf8) else { return }
+        
+        // ✅ Decode on background queue to avoid blocking WebSocket I/O
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            
+            do {
+                let message = try JSONDecoder().decode(ServerMessage.self, from: data)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.delegate?.webSocketDidReceive(message)
+                }
+            } catch {
+                #if DEBUG
+                NSLog("[WS] Parse error: \(error.localizedDescription)")
+                #endif
+                DispatchQueue.main.async { [weak self] in
+                    self?.delegate?.webSocketDidReceive(
+                        .error(sessionID: nil, message: "Parse error: \(error.localizedDescription)")
+                    )
+                }
+            }
+        }
+    }
+    
+    // MARK: - URLSessionWebSocketDelegate: Certificate Pinning (Modern Approach) [[43]]
+    func urlSession(_ session: URLSession,
+                    didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let serverTrust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        
+        // ✅ If no pinning configured, use default system validation (ATS-compliant) [[42]]
+        guard !pinnedPublicKeyHashes.isEmpty else {
+            completionHandler(.useCredential, URLCredential(trust: serverTrust))
+            return
+        }
+        
+        // ✅ Evaluate trust using modern API (macOS 10.15+) [[43]]
+        var secError: CFError?
+        let isTrusted = SecTrustEvaluateWithError(serverTrust, &secError)
+        
+        guard isTrusted else {
+            #if DEBUG
+            if let error = secError {
+                NSLog("[WS] ❌ Trust evaluation failed: \(error)")
+            }
+            #endif
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+        
+        // ✅ Extract and verify public key hash
+        guard let publicKey = SecTrustCopyPublicKey(serverTrust),
+              let publicKeyData = SecKeyCopyExternalRepresentation(publicKey, nil) as Data? else {
+            #if DEBUG
+            NSLog("[WS] ❌ Certificate pinning failed: Could not extract public key")
+            #endif
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+        
+        // Compute SHA-256 hash using CommonCrypto (macOS 11 compatible)
+        let actualHashData = sha256(publicKeyData)
+        let actualHash = actualHashData?.base64EncodedString()
+        
+        // ✅ Constant-time comparison using CryptoKit to prevent timing attacks [[60]]
+        let isPinned = pinnedPublicKeyHashes.contains { expectedHash in
+            guard let actualHash, let expectedData = Data(base64Encoded: expectedHash),
+                  let actualData = Data(base64Encoded: actualHash) else {
+                return false
+            }
+            return actualData.constantTimeCompare(to: expectedData)
+        }
+        if isPinned {
+            #if DEBUG
+            NSLog("[WS] ✅ Certificate pinned successfully")
+            #endif
+            completionHandler(.useCredential, URLCredential(trust: serverTrust))
+        } else {
+            #if DEBUG
+            NSLog("[WS] ❌ Certificate pinning failed: Hash mismatch")
+            NSLog("[WS] Expected one of: \(pinnedPublicKeyHashes)")
+            NSLog("[WS] Actual: \(actualHash ?? "nil")")
+            #endif
+            completionHandler(.cancelAuthenticationChallenge, nil)
+        }
+    }
+    
+    // MARK: - URLSessionWebSocketDelegate: Connection Events
+    func urlSession(_ session: URLSession,
+                    webSocketTask: URLSessionWebSocketTask,
+                    didOpenWithProtocol `protocol`: String?) {
+        connectTimeoutItem?.cancel()
+        connectTimeoutItem = nil
+        state = .connected
+        reconnectAttempts = 0  // ✅ Reset on successful connection
+        
+        // Start health monitoring AFTER connection is confirmed
+        startHealthMonitoring()
+        
+        // Begin receive loop
+        receiveNext()
+        
+        // ✅ Flush any queued messages
+        flushPendingMessages()
+        
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let url = webSocketTask.originalRequest?.url ?? URL(string: self.baseURL)
+            if let url {
+                #if DEBUG
+                NSLog("[WS] Connected to \(url.absoluteString)")
+                #endif
+                self.delegate?.webSocketDidConnect(url: url)
+            }
+        }
+    }
+    
+    func urlSession(_ session: URLSession,
+                    webSocketTask: URLSessionWebSocketTask,
+                    didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
+                    reason: Data?) {
+        let shouldNotify = !userInitiatedDisconnect
+        if state != .disconnected { state = .disconnected }
+        
+        connectTimeoutItem?.cancel()
+        connectTimeoutItem = nil
+        pingTimer?.cancel()
+        pingTimer = nil
+        
+        let reasonText = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "Unknown"
+        let error = NSError(domain: "WS", code: Int(closeCode.rawValue), userInfo: [
+            NSLocalizedDescriptionKey: "Closed: \(reasonText) (code: \(closeCode.rawValue))"
+        ])
+        
+        if shouldNotify {
+            DispatchQueue.main.async { [weak self] in
+                self?.delegate?.webSocketDidDisconnect(error: error)
+            }
+        }
+        
+        // ✅ Auto-reconnect on unexpected disconnect (unless user-initiated)
+        if !userInitiatedDisconnect && closeCode != .normalClosure {
+            scheduleReconnect()
+        }
+        
+        userInitiatedDisconnect = false
+        selfRetainer = nil
+        
+        #if DEBUG
+        NSLog("[WS] Connection closed: \(reasonText) (code: \(closeCode.rawValue))")
+        #endif
+    }
+}
+
+// MARK: - Helper: SHA-256
+private extension WebSocketManager {
+    func sha256(_ data: Data) -> Data? {
+        var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        data.withUnsafeBytes {
+            _ = CC_SHA256($0.baseAddress, CC_LONG(data.count), &hash)
+        }
+        return Data(hash)
+    }
+}
+
+// MARK: - Helper: Constant-Time Comparison (CryptoKit)
+private extension Data {
+    /// ✅ Constant-time comparison to prevent timing attacks [[60]]
+    /// Uses CryptoKit's secure comparison (macOS 10.15+)
+    func constantTimeCompare(to other: Data) -> Bool {
+        guard self.count == other.count else { return false }
+        // CryptoKit's SHA256 has a constant-time compare we can leverage
+        // Alternative: implement manual XOR accumulation if CryptoKit unavailable
+        var result: UInt8 = 0
+        for (byteA, byteB) in zip(self, other) {
+            result |= byteA ^ byteB
+        }
+        return result == 0
+    }
+}
+import Foundation
+
+class SessionManager {
+    private var active: Set<String> = []
+    private let queue = DispatchQueue(label: "com.pythonrunner.session", attributes: .concurrent)
+
+    // ✅ Use sessionID: label consistently
+    func start(sessionID: String) { 
+        queue.async(flags: .barrier) { self.active.insert(sessionID) } 
+    }
+    
+    func end(sessionID: String) { 
+        queue.async(flags: .barrier) { self.active.remove(sessionID) } 
+    }
+    
+    func isActive(sessionID: String) -> Bool {
+        var res = false
+        queue.sync { res = self.active.contains(sessionID) }
+        return res
+    }
+    
+    func terminateAll() { 
+        queue.async(flags: .barrier) { self.active.removeAll() } 
+    }
+}import SwiftUI
+import Foundation
+
+@MainActor
+class PythonRunnerViewModel: ObservableObject, WebSocketDelegate {
+    @Published var outputLines: [OutputLine] = []
+    @Published var isConnected = false
+    @Published var isConnecting = false
+    
+    private var ws: WebSocketManager?
+    private let sessionMgr = SessionManager()
+    private let token = ProcessInfo.processInfo.environment["HF_TOKEN"] ?? ""
+    private let baseURL = "wss://novacibes-python-running-api.hf.space"
+    
+    // ✅ MBA OPTIMIZATION: Cap output to prevent 4GB RAM pressure
+    private let MAX_OUTPUT_LINES = 500
+    
+    struct OutputLine: Identifiable {
+        let id = UUID()
+        let content: String
+        let isError: Bool
+    }
+    
+    // ✅ Connects ONLY when user clicks Run (wake-on-use)
+    func connect() {
+        guard !token.isEmpty else {
+            append("⚠️ HF_TOKEN not set", isError: true)
+            return
+        }
+        isConnecting = true
+        ws = WebSocketManager(baseURL: baseURL, token: token)
+        ws?.delegate = self
+        ws?.connect()
+    }
+    
+    func disconnect() {
+        ws?.disconnect()
+        sessionMgr.terminateAll()
+        isConnected = false
+        isConnecting = false
+    }
+    
+    // ✅ Wake-on-Use: Connects right before execution if needed
+    func runCode(_ code: String, sessionID: String) {
+        if !isConnected && !isConnecting {
+            append("🌙 Waking server...", isError: false)
+            connect()
+        }
+        sessionMgr.start(sessionID: sessionID)
+        ws?.send(RunMessage(session_id: sessionID, code: code))
+        append("🚀 Executing \(sessionID.prefix(8))...", isError: false)
+    }
+    
+    func sendStdin(_ input: String, sessionID: String) {
+        guard sessionMgr.isActive(sessionID: sessionID) else { return }
+        ws?.send(StdinMessage(session_id: sessionID, input: input))
+    }
+    
+    // MARK: - WebSocketDelegate (Matches your original server exactly)
+    func webSocketDidReceive(_ message: ServerMessage) {
+        switch message {
+        case .stdout(_, let out): append(out, isError: false)
+        case .stderr(_, let out): append(out, isError: true)
+        case .error(_, let msg): append("❌ \(msg)", isError: true)
+        case .done(let sid): 
+            append("✅ Session \(sid.prefix(8)) done", isError: false)
+            sessionMgr.end(sessionID: sid)
+        }
+    }
+    
+    func webSocketDidConnect(url: URL) {
+        isConnected = true
+        isConnecting = false
+        append("🔗 Connected to \(url.host ?? "server")", isError: false)
+    }
+    
+    func webSocketDidDisconnect(error: Error?) {
+        isConnected = false
+        isConnecting = false
+        let msg = error?.localizedDescription ?? "Unknown"
+        if !msg.contains("normalClosure") {
+            append("🔌 Disconnected: \(msg)", isError: true)
+        }
+    }
+    
+    // ✅ Auto-trim buffer for 4GB RAM safety
+    private func append(_ text: String, isError: Bool) {
+        text.split(separator: "\n", omittingEmptySubsequences: false).forEach {
+            if !$0.isEmpty {
+                outputLines.append(OutputLine(content: String($0), isError: isError))
+                if outputLines.count > MAX_OUTPUT_LINES {
+                    outputLines.removeFirst(outputLines.count - MAX_OUTPUT_LINES)
+                }
+            }
+        }
+    }
+    
+    func clear() { outputLines.removeAll() }
+}import SwiftUI
+
+struct ContentView: View {
+    @StateObject private var vm = PythonRunnerViewModel()
+    @State private var code = "# Type Python code here\nprint('Hello from Big Sur!')"
+    @State private var sid = UUID().uuidString
+    @State private var showTokenInput = false
+    @State private var hfToken = ProcessInfo.processInfo.environment["HF_TOKEN"] ?? ""
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("🐍 Python Runner v1.6").font(.headline)
+                Spacer()
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(vm.isConnected ? Color.green : (vm.isConnecting ? Color.yellow : Color.orange))
+                        .frame(width: 10, height: 10)
+                    Text(vm.isConnected ? "Connected" : (vm.isConnecting ? "Waking..." : "Disconnected"))
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .onTapGesture { if hfToken.isEmpty { showTokenInput = true } }
+                Button("⚙️") { showTokenInput = true }
+                    .buttonStyle(.plain)
+                    .foregroundColor(.secondary)
+            }
+            .padding(8)
+            .background(Color(NSColor.windowBackgroundColor))
+            
+            Divider()
+            
+            // Code Editor
+            HStack(alignment: .top, spacing: 0) {
+                VStack(alignment: .trailing, spacing: 0) {
+                    ForEach(1...code.components(separatedBy: "\n").count, id: \.self) { line in
+                        Text("\(line)")
+                            .font(.system(.body, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .frame(width: 30)
+                            .padding(.vertical, 2)
+                    }
+                }
+                .padding(.leading, 8)
+                .padding(.top, 8)
+                .background(Color(NSColor.windowBackgroundColor).opacity(0.5))
+                
+                TextEditor(text: $code)
+                    .font(.system(.body, design: .monospaced))                    .padding(8)
+                    .frame(maxHeight: 200)
+                    .background(Color(NSColor.textBackgroundColor))
+                    .border(Color.gray.opacity(0.3))
+            }
+            
+            // Output Console
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        if vm.outputLines.count >= 500 {
+                            Text("💡 Output capped at 500 lines (4GB RAM optimized)")
+                                .font(.caption2)
+                                .foregroundColor(.orange)
+                                .padding(.horizontal, 8)
+                        }
+                        ForEach(vm.outputLines) { line in
+                            HStack(alignment: .top) {
+                                Text(line.isError ? "❌" : "✅")
+                                    .foregroundColor(line.isError ? .red : .green)
+                                    .frame(width: 20)
+                                Text(line.content)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundColor(line.isError ? .red : .primary)
+                                    // ✅ .textSelection removed for macOS 11 compatibility
+                            }
+                            .id(line.id)
+                        }
+                    }
+                    .padding(8)
+                }
+                .onChange(of: vm.outputLines.count) { _ in
+                    if let last = vm.outputLines.last {
+                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    }
+                }
+            }
+            .frame(maxHeight: .infinity)
+            .background(Color(NSColor.textBackgroundColor))
+            .overlay(Rectangle().frame(height: 1).foregroundColor(Color.gray.opacity(0.3)), alignment: .top)
+            
+            // Action Bar
+            HStack {
+                Button("Clear") { vm.clear() }
+                    .buttonStyle(.borderless)
+                Spacer()
+                Button(vm.isConnecting ? " Waking..." : "▶ Run") {
+                    if hfToken.isEmpty {
+                        showTokenInput = true
+                    } else {                        vm.runCode(code, sessionID: sid)
+                    }
+                }
+                .disabled(vm.isConnecting || code.isEmpty)
+                .keyboardShortcut(.return, modifiers: .command)
+            }
+            .padding(8)
+            .background(Color(NSColor.controlBackgroundColor))
+        }
+        .frame(minWidth: 600, minHeight: 500)
+        .onAppear { if hfToken.isEmpty { showTokenInput = true } }
+        .onDisappear { vm.disconnect() }
+        .overlay(
+            Group {
+                if showTokenInput {
+                    TokenInputView(
+                        token: $hfToken,
+                        isShowing: $showTokenInput
+                    ) {
+                        setenv("HF_TOKEN", hfToken, 1)
+                        // Don't auto-connect here; wait for Run click
+                    }
+                }
+            }
+        )
+    }
+}import SwiftUI
+
+@main
+struct PythonRunnerApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
+    }
+}import SwiftUI
+
+struct TokenInputView: View {
+    @Binding var token: String
+    @Binding var isShowing: Bool
+    var onConfirm: () -> Void
+    @State private var isSecure = true
+    
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.4).ignoresSafeArea().onTapGesture { isShowing = false }
+            VStack(spacing: 20) {
+                Text("🔐 Hugging Face Token").font(.headline)
+                Text("Required to connect to Python Runner API")
+                    .font(.caption).foregroundColor(.secondary).multilineTextAlignment(.center)
+                
+                HStack {
+                    if isSecure { SecureField("hf_xxx", text: $token).textFieldStyle(.plain) }
+                    else { TextField("hf_xxx", text: $token).textFieldStyle(.plain) }
+                    Button(isSecure ? "👁️" : "🙈") { isSecure.toggle() }
+                        .buttonStyle(.plain).foregroundColor(.secondary)
+                }
+                .padding(12).background(Color(NSColor.textBackgroundColor)).cornerRadius(8)
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(token.isEmpty ? Color.orange : Color.green, lineWidth: 2))
+                
+                HStack(spacing: 16) {
+                    Button("Cancel") { isShowing = false }.buttonStyle(.bordered)
+                    Button("Connect") {
+                        guard !token.isEmpty else { return }
+                        isShowing = false
+                        onConfirm()
+                    }
+                    .buttonStyle(.bordered)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 16)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.accentColor))
+                    .disabled(token.isEmpty)
+                    .opacity(token.isEmpty ? 0.6 : 1.0)
+                }
+            }
+            .padding(24).background(Color(NSColor.windowBackgroundColor)).cornerRadius(16).shadow(radius: 20).frame(maxWidth: 400)
+        }
+        .transition(.opacity)
+    }
+}

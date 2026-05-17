@@ -1,0 +1,104 @@
+name: 🍎 Build macOS App
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Create GitHub Release"
+        required: false
+        default: "false"
+        type: choice
+        options: [ "true", "false" ]
+
+env:
+  APP_NAME: PythonRunner
+  ARCH: x86_64
+
+jobs:
+  build:
+    name: 🔨 Build + Package DMG
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Swift Version
+        run: swift --version
+
+      - name: Build Swift App
+        run: |
+          swift build -c release --arch ${{ env.ARCH }}
+
+      - name: Locate Binary
+        run: |
+          BINARY=$(find .build -type f -name "${{ env.APP_NAME }}" | head -n 1)
+          echo "BINARY=$BINARY" >> $GITHUB_ENV
+          echo "Found binary at: $BINARY"
+
+      - name: Create App Bundle
+        run: |
+          APP_DIR=".build/artifacts/${{ env.APP_NAME }}.app"
+          mkdir -p "$APP_DIR/Contents/MacOS"
+          mkdir -p "$APP_DIR/Contents/Resources"
+
+          cp "$BINARY" "$APP_DIR/Contents/MacOS/"
+          chmod +x "$APP_DIR/Contents/MacOS/${{ env.APP_NAME }}"
+
+          cp Info.plist "$APP_DIR/Contents/"
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Create DMG
+        run: |
+          DMG_PATH=".build/artifacts/${{ env.APP_NAME }}.dmg"
+          APP_PATH=".build/artifacts/${{ env.APP_NAME }}.app"
+
+          create-dmg \
+            --volname "${{ env.APP_NAME }}" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "${{ env.APP_NAME }}.app" 175 120 \
+            --hide-extension "${{ env.APP_NAME }}.app" \
+            --app-drop-link 425 120 \
+            "$DMG_PATH" \
+            "$APP_PATH"
+
+          echo "DMG_PATH=$DMG_PATH" >> $GITHUB_ENV
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macOS-DMG
+          path: .build/artifacts/*.dmg
+          retention-days: 14
+
+  release:
+    name: 🚀 Create Release
+    runs-on: macos-13
+    needs: build
+    if: github.ref_type == 'tag' || github.event.inputs.release == 'true'
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macOS-DMG
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
