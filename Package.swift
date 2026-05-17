@@ -11,7 +11,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/evgenyneu/keychain-swift.git", from: "20.0.0"),
-        .package(url: "https://github.com/louisdh/Sourceful.git", from: "0.5.0")
+        .package(url: "https://github.com/twostraws/Sourceful.git", from: "0.5.0")
     ],
     targets: [
         .executableTarget(
@@ -20,7 +20,7 @@ let package = Package(
                 .product(name: "KeychainSwift", package: "keychain-swift"),
                 .product(name: "Sourceful", package: "Sourceful")
             ],
-            path: "NovaCibesRunner"
+            path: "test-editor"
         )
     ]
 )
