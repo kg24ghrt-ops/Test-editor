@@ -60,22 +60,26 @@ final class MainViewController: NSViewController {
     }
     
     // MARK: - Core Execution Actions
+        // MARK: - Core Execution Actions
     @objc func runScript(_ sender: Any?) {
         outputVC.clear()
         outputVC.append(stdout: "Executing script on NovaCibes Runner...\n", stderr: "")
         
-        // ✅ Fixed: Added '@MainActor' to contextually hop the callback safely back to the UI thread
-        apiService.run(code: document.content) { @MainActor [weak self] result in
-            guard let self = self else { return }
-            switch result {
-            case .success(let output):
-                self.outputVC.append(stdout: output.stdout, stderr: output.stderr)
-            case .failure(let error):
-                self.outputVC.append(stdout: "", stderr: "\n[Error]: \(error.localizedDescription)\n")
+        // Removed the strict @MainActor attribute from the closure signature
+        apiService.run(code: document.content) { [weak self] result in
+            // ✅ Explicitly hop back to the Main Actor inside the block
+            Task { @MainActor in
+                guard let self = self else { return }
+                switch result {
+                case .success(let output):
+                    self.outputVC.append(stdout: output.stdout, stderr: output.stderr)
+                case .failure(let error):
+                    self.outputVC.append(stdout: "", stderr: "\n[Error]: \(error.localizedDescription)\n")
+                }
             }
         }
     }
-    
+
     @objc func cancelRun(_ sender: Any?) {
         apiService.cancelRun()
         outputVC.append(stdout: "\nExecution canceled by user.\n", stderr: "")
@@ -149,8 +153,8 @@ final class MainViewController: NSViewController {
 }
 
 // MARK: - Delegate Conformance
-extension MainViewController: @preconcurrency EditorViewControllerDelegate {
-    func editorTextDidChange(_ content: String) {
+extension MainViewController: EditorViewControllerDelegate {
+   func editorTextDidChange(_ content: String) {
         document.content = content
         if !document.isDirty {
             document.isDirty = true
