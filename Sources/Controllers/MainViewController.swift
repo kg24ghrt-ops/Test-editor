@@ -1,7 +1,7 @@
 import AppKit
 import UniformTypeIdentifiers
 
-// ✅ Added @MainActor to isolate this UI controller to the main thread
+// ✅ Explicit MainActor isolation guarantees this entire UI class stays on the main thread
 @MainActor
 final class MainViewController: NSViewController {
     weak var window: NSWindow?
@@ -39,16 +39,19 @@ final class MainViewController: NSViewController {
     }
     
     private func checkTokenRequirement() {
-        if TokenManager.shared.getToken() == nil {
-            let alert = NSAlert()
-            alert.messageText = "Hugging Face Token Required"
-            alert.informativeText = "Please paste your NovaCibes API validation token below:"
-            alert.addButton(withTitle: "Save")
-            
-            let input = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-            alert.accessoryView = input
-            
-            alert.beginSheetModal(for: self.view.window!) { response in
+        guard TokenManager.shared.getToken() == nil else { return }
+        
+        let alert = NSAlert()
+        alert.messageText = "Hugging Face Token Required"
+        alert.informativeText = "Please paste your NovaCibes API validation token below:"
+        alert.addButton(withTitle: "Save")
+        
+        let input = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        alert.accessoryView = input
+        
+        // Dynamic unwrap safety check for sheet presentation
+        if let targetWindow = self.view.window {
+            alert.beginSheetModal(for: targetWindow) { response in
                 if response == .alertFirstButtonReturn {
                     TokenManager.shared.save(token: input.stringValue)
                 }
@@ -61,13 +64,14 @@ final class MainViewController: NSViewController {
         outputVC.clear()
         outputVC.append(stdout: "Executing script on NovaCibes Runner...\n", stderr: "")
         
-        apiService.run(code: document.content) { [weak self] result in
-            // ✅ Updates to UI components here are now guaranteed to run safely on the MainActor
+        // ✅ Fixed: Added '@MainActor' to contextually hop the callback safely back to the UI thread
+        apiService.run(code: document.content) { @MainActor [weak self] result in
+            guard let self = self else { return }
             switch result {
             case .success(let output):
-                self?.outputVC.append(stdout: output.stdout, stderr: output.stderr)
+                self.outputVC.append(stdout: output.stdout, stderr: output.stderr)
             case .failure(let error):
-                self?.outputVC.append(stdout: "", stderr: "\n[Error]: \(error.localizedDescription)\n")
+                self.outputVC.append(stdout: "", stderr: "\n[Error]: \(error.localizedDescription)\n")
             }
         }
     }
@@ -82,8 +86,7 @@ final class MainViewController: NSViewController {
         editorVC.clear()
         outputVC.clear()
         document = Document()
-        window?.title = "Untitled — NovaCibes Runner"
-        window?.isDocumentEdited = false
+        updateWindowTitle(fileName: "Untitled")
     }
     
     @objc func openDocument(_ sender: Any?) {
@@ -91,17 +94,17 @@ final class MainViewController: NSViewController {
         panel.allowedContentTypes = [UTType.pythonScript]
         panel.allowsMultipleSelection = false
         
-        panel.beginSheetModal(for: self.view.window!) { [weak self] response in
+        guard let targetWindow = self.view.window else { return }
+        
+        panel.beginSheetModal(for: targetWindow) { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
             do {
-                let content = try String(contentsOf: url, encoding: String.Encoding.utf8)
+                let content = try String(contentsOf: url) // Cleaned: Implicit UTF-8 usage
                 self?.document = Document(fileURL: url, content: content, isDirty: false)
                 self?.editorVC.load(content: content)
-                self?.window?.title = "\(url.lastPathComponent) — NovaCibes Runner"
-                self?.window?.isDocumentEdited = false
+                self?.updateWindowTitle(fileName: url.lastPathComponent)
             } catch {
-                let errorAlert = NSAlert(error: error)
-                errorAlert.runModal()
+                NSAlert(error: error).runModal()
             }
         }
     }
@@ -119,7 +122,9 @@ final class MainViewController: NSViewController {
         panel.allowedContentTypes = [UTType.pythonScript]
         panel.nameFieldStringValue = document.fileURL?.lastPathComponent ?? "script.py"
         
-        panel.beginSheetModal(for: self.view.window!) { [weak self] response in
+        guard let targetWindow = self.view.window else { return }
+        
+        panel.beginSheetModal(for: targetWindow) { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
             self?.writeDocumentData(to: url)
         }
@@ -127,20 +132,23 @@ final class MainViewController: NSViewController {
     
     private func writeDocumentData(to url: URL) {
         do {
-            try document.content.write(to: url, atomically: true, encoding: String.Encoding.utf8)
+            try document.content.write(to: url, atomically: true, encoding: .utf8)
             document.fileURL = url
             document.isDirty = false
-            window?.isDocumentEdited = false
-            window?.title = "\(url.lastPathComponent) — NovaCibes Runner"
+            updateWindowTitle(fileName: url.lastPathComponent)
         } catch {
-            let errorAlert = NSAlert(error: error)
-            errorAlert.runModal()
+            NSAlert(error: error).runModal()
         }
+    }
+    
+    // Clean Helper: Centralizes uniform window title updates
+    private func updateWindowTitle(fileName: String) {
+        window?.title = "\(fileName) — NovaCibes Runner"
+        window?.isDocumentEdited = document.isDirty
     }
 }
 
 // MARK: - Delegate Conformance
-// ✅ Added @preconcurrency to bridge your custom text changes delegate cleanly with Swift 6 targets
 extension MainViewController: @preconcurrency EditorViewControllerDelegate {
     func editorTextDidChange(_ content: String) {
         document.content = content
