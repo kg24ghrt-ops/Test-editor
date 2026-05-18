@@ -1,9 +1,12 @@
 import AppKit
 import Sourceful
 
+// ✅ Add @MainActor and mark the closure parameter as @Sendable
+@MainActor
 protocol EditorViewControllerDelegate: AnyObject {
     func editorTextDidChange(_ content: String)
 }
+
 
 final class EditorViewController: NSViewController {
     weak var delegate: EditorViewControllerDelegate?
@@ -100,7 +103,8 @@ public struct PythonLexer: Lexer {
     }
 }
 
-extension EditorViewController: SyntaxTextViewDelegate {
+// ✅ Add @preconcurrency here to quiet down the compiler regarding Sourceful's layout rules
+extension EditorViewController: @preconcurrency SyntaxTextViewDelegate {
     func didChangeText(_ syntaxTextView: SyntaxTextView) {
         delegate?.editorTextDidChange(syntaxTextView.text)
     }

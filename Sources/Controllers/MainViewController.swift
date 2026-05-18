@@ -1,7 +1,9 @@
 import AppKit
 import UniformTypeIdentifiers
 
-final class MainViewController: NSViewController, EditorViewControllerDelegate {
+// ✅ Added @MainActor to isolate this UI controller to the main thread
+@MainActor
+final class MainViewController: NSViewController {
     weak var window: NSWindow?
     
     private var splitView: NSSplitView!
@@ -36,14 +38,6 @@ final class MainViewController: NSViewController, EditorViewControllerDelegate {
         editorVC.delegate = self
     }
     
-    func editorTextDidChange(_ content: String) {
-        document.content = content
-        if !document.isDirty {
-            document.isDirty = true
-            window?.isDocumentEdited = true
-        }
-    }
-    
     private func checkTokenRequirement() {
         if TokenManager.shared.getToken() == nil {
             let alert = NSAlert()
@@ -68,6 +62,7 @@ final class MainViewController: NSViewController, EditorViewControllerDelegate {
         outputVC.append(stdout: "Executing script on NovaCibes Runner...\n", stderr: "")
         
         apiService.run(code: document.content) { [weak self] result in
+            // ✅ Updates to UI components here are now guaranteed to run safely on the MainActor
             switch result {
             case .success(let output):
                 self?.outputVC.append(stdout: output.stdout, stderr: output.stderr)
@@ -140,6 +135,18 @@ final class MainViewController: NSViewController, EditorViewControllerDelegate {
         } catch {
             let errorAlert = NSAlert(error: error)
             errorAlert.runModal()
+        }
+    }
+}
+
+// MARK: - Delegate Conformance
+// ✅ Added @preconcurrency to bridge your custom text changes delegate cleanly with Swift 6 targets
+extension MainViewController: @preconcurrency EditorViewControllerDelegate {
+    func editorTextDidChange(_ content: String) {
+        document.content = content
+        if !document.isDirty {
+            document.isDirty = true
+            window?.isDocumentEdited = true
         }
     }
 }

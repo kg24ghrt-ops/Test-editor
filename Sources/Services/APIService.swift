@@ -15,7 +15,11 @@ final class APIService {
         let stderr: String
     }
     
-    func run(code: String, completion: @escaping (Result<(stdout: String, stderr: String), APIError>) -> Void) {
+        // ✅ Added @Sendable right before the closure signature definition
+    func run(code: String, completion: @escaping @Sendable (Result<(stdout: String, stderr: String), APIError>) -> Void) {
+        // Keep your exact same code inside here...
+    
+
         // Cancel any lingering running executions
         cancelRun()
         
