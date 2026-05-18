@@ -1,5 +1,7 @@
 import Foundation
 
+// ✅ Added @MainActor to handle all state changes (like activeTask) safely on the main thread
+@MainActor
 final class APIService {
     private let apiURLString = "https://novacibes-python-running-api.hf.space/run"
     private var activeTask: URLSessionDataTask?
@@ -42,43 +44,34 @@ final class APIService {
         }
         
         activeTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            defer { self?.activeTask = nil }
-            
-            if let error = error {
-                DispatchQueue.main.async {
+            // ✅ Wrap everything in a MainActor task context to satisfy the Swift 6 compiler
+            Task { @MainActor in
+                defer { self?.activeTask = nil }
+                
+                if let error = error {
                     completion(.failure(.networkError(error)))
+                    return
                 }
-                return
-            }
-            
-            guard let httpResponse = response as? HTTPURLResponse else {
-                DispatchQueue.main.async {
+                
+                guard let httpResponse = response as? HTTPURLResponse else {
                     completion(.failure(.serverError(statusCode: 0)))
+                    return
                 }
-                return
-            }
-            
-            guard (200...299).contains(httpResponse.statusCode) else {
-                DispatchQueue.main.async {
+                
+                guard (200...299).contains(httpResponse.statusCode) else {
                     completion(.failure(.serverError(statusCode: httpResponse.statusCode)))
+                    return
                 }
-                return
-            }
-            
-            guard let data = data else {
-                DispatchQueue.main.async {
+                
+                guard let data = data else {
                     completion(.success((stdout: "", stderr: "")))
+                    return
                 }
-                return
-            }
-            
-            do {
-                let decodedResponse = try JSONDecoder().decode(APIResponsePayload.self, from: data)
-                DispatchQueue.main.async {
+                
+                do {
+                    let decodedResponse = try JSONDecoder().decode(APIResponsePayload.self, from: data)
                     completion(.success((stdout: decodedResponse.stdout, stderr: decodedResponse.stderr)))
-                }
-            } catch {
-                DispatchQueue.main.async {
+                } catch {
                     completion(.failure(.decodingError(error)))
                 }
             }
