@@ -2,13 +2,18 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>CFBundleExecutable</key>
+    <string>PythonRunner</string>
+    
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    
     <key>CFBundleName</key><string>PythonRunner</string>
     <key>CFBundleIdentifier</key><string>com.yourname.PythonRunner</string>
     <key>CFBundleVersion</key><string>3</string>
     <key>CFBundleShortVersionString</key><string>1.7.0</string>
     <key>LSMinimumSystemVersion</key><string>11.0</string>
     
-    <!-- ✅ ADD THIS: Icon reference -->
     <key>CFBundleIconFile</key>
     <string>PythonRunner</string>
     <key>CFBundleIconName</key>
