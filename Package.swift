@@ -4,7 +4,6 @@ import PackageDescription
 let package = Package(
     name: "NovaCibesRunner",
     platforms: [
-        // Retains compatibility with your 2013 MacBook Air
         .macOS(.v11)
     ],
     products: [
@@ -21,11 +20,9 @@ let package = Package(
                 .product(name: "KeychainSwift", package: "keychain-swift"),
                 .product(name: "Sourceful", package: "Sourceful")
             ],
-            // Isolates source compilation to avoid tracking server.py or build folders
-            path: "Sources/NovaCibesRunner",
+            // CHANGED: Points directly to your actual folder layout
+            path: "Sources", 
             swiftSettings: [
-                // Compiles with Swift 5 parameters using Swift 6.1 tools.
-                // This stops strict concurrency errors from breaking the build.
                 .swiftLanguageMode(.v5)
             ]
         )
