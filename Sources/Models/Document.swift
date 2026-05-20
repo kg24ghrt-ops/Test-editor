@@ -5,6 +5,10 @@ struct Document {
     var content: String
     var isDirty: Bool
     
+    var fileName: String {
+        return fileURL?.lastPathComponent ?? "Untitled"
+    }
+    
     init(fileURL: URL? = nil, content: String = "", isDirty: Bool = false) {
         self.fileURL = fileURL
         self.content = content

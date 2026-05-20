@@ -1,164 +1,110 @@
 import AppKit
-import UniformTypeIdentifiers
 
-// ✅ Explicit MainActor isolation guarantees this entire UI class stays on the main thread
-@MainActor
-final class MainViewController: NSViewController {
-    weak var window: NSWindow?
+final class MainViewController: NSViewController, EditorViewControllerDelegate, OutputViewControllerDelegate, APIServiceDelegate {
     
-    private var splitView: NSSplitView!
+    private let splitView = NSSplitView()
     private let editorVC = EditorViewController()
     private let outputVC = OutputViewController()
     private let apiService = APIService()
-    private var document = Document()
+    
+    private var currentDocument = Document()
     
     override func loadView() {
-        self.view = NSView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
-        setupSplitView()
-    }
-    
-    override func viewDidAppear() {
-        super.viewDidAppear()
-        checkTokenRequirement()
-    }
-    
-    private func setupSplitView() {
-        splitView = NSSplitView(frame: self.view.bounds)
-        splitView.autoresizingMask = [.width, .height]
+        self.view = NSView()
+        view.frame = NSRect(x: 0, y: 0, width: 800, height: 600)
+        
+        splitView.translatesAutoresizingMaskIntoConstraints = false
         splitView.isVertical = false
         splitView.dividerStyle = .thin
+        view.addSubview(splitView)
         
         addChild(editorVC)
         addChild(outputVC)
         
-        splitView.addSubview(editorVC.view)
-        splitView.addSubview(outputVC.view)
-        self.view.addSubview(splitView)
+        splitView.addArrangedSubview(editorVC.view)
+        splitView.addArrangedSubview(outputVC.view)
+        
+        NSLayoutConstraint.activate([
+            splitView.topAnchor.constraint(equalTo: view.topAnchor),
+            splitView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            splitView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            splitView.trailingAnchor.constraint(equalTo: view.trailingAnchor)
+        ])
         
         editorVC.delegate = self
+        outputVC.delegate = self
+        apiService.delegate = self
     }
     
-    private func checkTokenRequirement() {
-        guard TokenManager.shared.getToken() == nil else { return }
-        
-        let alert = NSAlert()
-        alert.messageText = "Hugging Face Token Required"
-        alert.informativeText = "Please paste your NovaCibes API validation token below:"
-        alert.addButton(withTitle: "Save")
-        
-        let input = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        alert.accessoryView = input
-        
-        // Dynamic unwrap safety check for sheet presentation
-        if let targetWindow = self.view.window {
-            alert.beginSheetModal(for: targetWindow) { response in
-                if response == .alertFirstButtonReturn {
-                    TokenManager.shared.save(token: input.stringValue)
-                }
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        verifyTokenPresence()
+        apiService.connect()
+    }
+    
+    private func verifyTokenPresence() {
+        if TokenManager.shared.getToken() == nil {
+            let alert = NSAlert()
+            alert.messageText = "Hugging Face Access Token Required"
+            alert.informativeText = "Please enter your authentication token to communicate securely with NovaCibes spaces:"
+            let input = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+            alert.accessoryView = input
+            alert.addButton(withTitle: "Save")
+            
+            if alert.runModal() == .alertFirstButtonReturn {
+                _ = TokenManager.shared.saveToken(input.stringValue)
             }
         }
     }
     
-    // MARK: - Core Execution Actions
-        // MARK: - Core Execution Actions
-    @objc func runScript(_ sender: Any?) {
+    // MARK: - Actions Flow Engine
+    
+    @objc func runActiveScript() {
+        let code = editorVC.getText()
+        guard !code.isEmpty else { return }
         outputVC.clear()
-        outputVC.append(stdout: "Executing script on NovaCibes Runner...\n", stderr: "")
-        
-        // Removed the strict @MainActor attribute from the closure signature
-        apiService.run(code: document.content) { [weak self] result in
-            // ✅ Explicitly hop back to the Main Actor inside the block
-            Task { @MainActor in
-                guard let self = self else { return }
-                switch result {
-                case .success(let output):
-                    self.outputVC.append(stdout: output.stdout, stderr: output.stderr)
-                case .failure(let error):
-                    self.outputVC.append(stdout: "", stderr: "\n[Error]: \(error.localizedDescription)\n")
-                }
-            }
-        }
-    }
-
-    @objc func cancelRun(_ sender: Any?) {
-        apiService.cancelRun()
-        outputVC.append(stdout: "\nExecution canceled by user.\n", stderr: "")
+        outputVC.appendText("🚀 Initializing execution process tunnel...\n", color: .systemGreen)
+        apiService.runCode(code)
     }
     
-    // MARK: - File I/O Actions
-    @objc func newDocument(_ sender: Any?) {
-        editorVC.clear()
-        outputVC.clear()
-        document = Document()
-        updateWindowTitle(fileName: "Untitled")
+    @objc func stopActiveScript() {
+        apiService.stopExecution()
+        outputVC.appendText("\n🛑 Terminate signal sent by client user.\n", color: .systemRed)
     }
     
-    @objc func openDocument(_ sender: Any?) {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [UTType.pythonScript]
-        panel.allowsMultipleSelection = false
-        
-        guard let targetWindow = self.view.window else { return }
-        
-        panel.beginSheetModal(for: targetWindow) { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
-            do {
-                let content = try String(contentsOf: url) // Cleaned: Implicit UTF-8 usage
-                self?.document = Document(fileURL: url, content: content, isDirty: false)
-                self?.editorVC.load(content: content)
-                self?.updateWindowTitle(fileName: url.lastPathComponent)
-            } catch {
-                NSAlert(error: error).runModal()
-            }
+    // MARK: - Delegate Pipelines
+    
+    func editorTextDidChange(newText: String) {
+        currentDocument.content = newText
+        if !currentDocument.isDirty {
+            currentDocument.isDirty = true
+            view.window?.isDocumentEdited = true
         }
     }
     
-    @objc func saveDocument(_ sender: Any?) {
-        if let url = document.fileURL {
-            writeDocumentData(to: url)
-        } else {
-            saveDocumentAs(sender)
-        }
+    func outputRequestedStdinSubmission(_ input: String) {
+        apiService.sendStdin(input)
     }
     
-    @objc func saveDocumentAs(_ sender: Any?) {
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [UTType.pythonScript]
-        panel.nameFieldStringValue = document.fileURL?.lastPathComponent ?? "script.py"
-        
-        guard let targetWindow = self.view.window else { return }
-        
-        panel.beginSheetModal(for: targetWindow) { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
-            self?.writeDocumentData(to: url)
-        }
+    func apiServiceDidReceiveStdout(_ text: String) {
+        outputVC.appendText(text, color: .textColor)
     }
     
-    private func writeDocumentData(to url: URL) {
-        do {
-            try document.content.write(to: url, atomically: true, encoding: .utf8)
-            document.fileURL = url
-            document.isDirty = false
-            updateWindowTitle(fileName: url.lastPathComponent)
-        } catch {
-            NSAlert(error: error).runModal()
-        }
+    func apiServiceDidReceiveStderr(_ text: String) {
+        outputVC.appendText(text, color: .systemRed)
     }
     
-    // Clean Helper: Centralizes uniform window title updates
-    private func updateWindowTitle(fileName: String) {
-        window?.title = "\(fileName) — NovaCibes Runner"
-        window?.isDocumentEdited = document.isDirty
+    func apiServiceDidReceiveError(_ message: String) {
+        outputVC.appendText("\n❌ Engine Error: \(message)\n", color: .systemOrange)
     }
-}
-
-// MARK: - Delegate Conformance
-extension MainViewController: EditorViewControllerDelegate {
-   func editorTextDidChange(_ content: String) {
-        document.content = content
-        if !document.isDirty {
-            document.isDirty = true
-            window?.isDocumentEdited = true
+    
+    func apiServiceExecutionDidComplete() {
+        outputVC.appendText("\n✨ Process finished execution cycle.\n", color: .systemGreen)
+    }
+    
+    func apiServiceConnectionStatusChanged(isConnected: Bool) {
+        if !isConnected {
+            outputVC.appendText("⚠️ WebSocket connection dropped. Retrying tunnel connection...\n", color: .systemOrange)
         }
     }
 }

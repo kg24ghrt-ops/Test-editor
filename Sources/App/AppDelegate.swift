@@ -1,33 +1,46 @@
 import AppKit
 
 @main
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    var window: NSWindow!
-    var editorViewController: EditorViewController!
-
-    // ✅ Removed 'override init' completely to avoid the isolated context error
-
+final class AppWindowDelegate: NSObject, NSApplicationDelegate {
+    private var window: NSWindow?
+    private let mainVC = MainViewController()
+    
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // ✅ Safe to call NSApp here on the MainActor
-        NSApp.setActivationPolicy(.regular)
-        
-        let mask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
-        
+        let windowMask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
-            styleMask: mask,
+            contentRect: NSRect(x: 0, y: 0, width: 850, height: 600),
+            styleMask: windowMask,
             backing: .buffered,
             defer: false
         )
         
-        editorViewController = EditorViewController()
-        window.contentViewController = editorViewController
+        window?.title = "NovaCibes Runner — Untitled"
+        window?.center()
+        window?.contentViewController = mainVC
+        window?.makeKeyAndOrderFront(nil)
         
-        window.title = "Python Runner"
-        window.center()
-        window.makeKeyAndOrderFront(nil)
+        setupProgrammaticMenu()
+    }
+    
+    private func setupProgrammaticMenu() {
+        let mainMenu = NSMenu()
         
-        NSApp.activate(ignoringOtherApps: true)
+        // App Main Category Menu dropdown
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "Quit NovaCibes", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenuItem.submenu = appMenu
+        
+        // Operational Run Operations Menu dropdown
+        let runMenuItem = NSMenuItem()
+        mainMenu.addItem(runMenuItem)
+        let runMenu = NSMenu(title: "Run")
+        runMenu.addItem(withTitle: "Run Script", action: #selector(MainViewController.runActiveScript), keyEquivalent: "r")
+        runMenu.addItem(withTitle: "Stop Execution", action: #selector(MainViewController.stopActiveScript), keyEquivalent: ".")
+        runMenuItem.submenu = runMenu
+        
+        NSApp.mainMenu = mainMenu
     }
     
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

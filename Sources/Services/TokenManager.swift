@@ -1,27 +1,61 @@
 import Foundation
-import KeychainSwift
+import Security
 
-// ✅ Add '@unchecked Sendable' to tell Swift 6 this class is thread-safe
-final class TokenManager: @unchecked Sendable {
+final class TokenManager {
     static let shared = TokenManager()
-    private let keychain = KeychainSwift()
-    private let tokenKey = "com.novacibes.NovaCibesRunner.hftoken"
-    
-    // Rest of your TokenManager code...
-
-
+    private let serviceName = "com.novacibes.runner.hftoken"
+    private let accountName = "hf_bearer_token"
     
     private init() {}
     
+    func saveToken(_ token: String) -> Bool {
+        guard let data = token.data(using: .utf8) else { return false }
+        
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: accountName
+        ]
+        
+        let attributes: [String: Any] = [
+            kSecValueData as String: data
+        ]
+        
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            var addQuery = query
+            addQuery[kSecValueData as String] = data
+            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+            return addStatus == errSecSuccess
+        }
+        return status == errSecSuccess
+    }
+    
     func getToken() -> String? {
-        return keychain.get(tokenKey)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: accountName,
+            kSecReturnData as String: kCFBooleanTrue!,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        
+        var dataTypeRef: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &dataTypeRef)
+        
+        if status == errSecSuccess, let data = dataTypeRef as? Data {
+            return String(data: data, encoding: .utf8)
+        }
+        return nil
     }
     
-    func save(token: String) {
-        keychain.set(token, forKey: tokenKey)
-    }
-    
-    func deleteToken() {
-        keychain.delete(tokenKey)
+    func deleteToken() -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: accountName
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 }
